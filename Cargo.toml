@@ -1,0 +1,7 @@
+[package]
+name = "oxide-tombstone"
+version = "0.1.0"
+edition = "2021"
+description = "Tombstone-based deletion for GPU distributed data with ternary states. {+1=alive, 0=tombstoned, -1=purged}. Lazy deletion, compaction, gc."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/oxide-tombstone"
