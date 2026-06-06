@@ -1,86 +1,41 @@
 # oxide-tombstone
 
-Tombstone-based deletion for GPU distributed data with ternary states. {+1=alive, 0=tombstoned, -1=purged}. Lazy deletion, compaction, gc.
+*Tombstone-based deletion for distributed GPU data. Mark deleted, propagate, garbage collect.*
 
-## Overview
+## Why This Exists
 
-# oxide-tombstone
-
-Tombstone-based deletion for GPU distributed data.
+In distributed GPU computing, you can't just free memory — other devices might have pointers to it. Tombstone deletion marks data as deleted (-1), propagates that state across devices, and only garbage collects when all devices acknowledge.
 
 ## Architecture
 
-This crate sits within the **five-layer Oxide Stack**:
+### Key Types
 
-| Layer | Crate | Role |
-|-------|-------|------|
-| 1 | open-parallel | Async runtime (tokio fork) |
-| 2 | pincher | "Vector DB as runtime, LLM as compiler" |
-| 3 | flux-core | Bytecode VM + A2A agent protocol |
-| 4 | cuda-oxide | Flux→MIR→Pliron→NVVM→PTX compiler |
-| 5 | cudaclaw | Persistent GPU kernels, warp consensus, SmartCRDT |
+Tombstone (deletion marker with timestamp), TombstoneMap (tracks deleted keys), GarbageCollector (reclaims tombstoned data after acknowledgment)
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### State Machine
 
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Code | 164 |
-| Public API Surface | 15 items |
-| License | Apache-2.0 |
-
-## Installation
-
-```toml
-[dependencies]
-oxide-tombstone = "0.1.0"
+```
++1 (Active/Arrived/Allocated)
+  ↓ transition event
+ 0 (Grace/InTransit/Fragmented)
+  ↓ transition event
+-1 (Reclaimable/NotStarted/Free)
 ```
 
 ## Usage
 
 ```rust
 use oxide_tombstone::*;
-// See src/lib.rs tests for complete working examples
+
+let mut map = TombstoneMap::new(); map.insert(key, value); map.tombstone(key); map.acknowledge(device_id, key); map.gc(); // only after all acks
 ```
 
-### Key Types
+## The Deeper Idea
 
-```
-- pub enum EntryState { Alive = 1, Tombstoned = 0, Purged = -1 }
-- pub struct Entry {
-- pub struct TombstoneStore {
-    pub fn new() -> Self {
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> u64 {
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-    pub fn get_any(&self, key: &[u8]) -> Option<&Entry> { self.entries.get(key) }
-    pub fn delete(&mut self, key: &[u8]) -> bool {
-    pub fn purge(&mut self, watermark_version: u64) -> usize {
-    pub fn compact(&mut self) -> usize {
-```
+Tombstones are the distributed systems equivalent of grace periods. The same pattern appears in CRDTs (mark then merge) and in the agent-semiosis crate (sign death before replacement).
 
-## Design Philosophy
+## Related Crates
 
-This crate uses **ternary algebra** (Z₃) where every value is {-1, 0, +1}:
-
-- **+1** → positive signal (healthy, allocated, converged, ready)
-- **0** → neutral (pending, balanced, monitoring, degraded)
-- **-1** → negative signal (failed, free, diverged, overloaded)
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary neural networks at 60% less power
-2. **GPU warp voting** — hardware ballot instructions return ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity (what goes in must come out)
-
-## Testing
-
-```bash
-git clone https://github.com/SuperInstance/oxide-tombstone.git
-cd oxide-tombstone
-cargo test
-```
-
-## License
-
-Apache-2.0
+- `oxide-fleet` — Fleet-level orchestration using these primitives
+- `oxide-sandbox` — Safe execution environment built on oxide primitives
+- `oxide-slotmap` — Slot-based memory management (complementary allocation strategy)
