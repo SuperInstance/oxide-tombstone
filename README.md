@@ -1,73 +1,115 @@
-# oxide-tombstone
+# Oxide Tombstone
 
-*Tombstone-based deletion for distributed GPU data. Don't delete — mark deleted, propagate the mark, garbage collect after acknowledgment. Because in a distributed system, free isn't free until everyone agrees.*
+**Oxide Tombstone** provides tombstone-based deletion for GPU distributed data with ternary entry states — `+1` (alive), `0` (tombstoned), `-1` (purged) — implementing lazy deletion, compaction, and garbage collection for concurrent data stores.
 
-## Why This Exists
+## Why It Matters
 
-On a single device, freeing memory is simple: call `free()`. In a distributed GPU system, other devices might have cached references to your data. If you free it while they're reading it, you get use-after-free corruption. If you wait for everyone to stop reading, you wait forever.
+Distributed key-value stores cannot synchronously delete data that may be replicated across nodes or actively read by concurrent threads. Tombstones solve this: a deleted key is marked as "tombstoned" (invisible to reads) but not physically removed. Later, a compaction pass purges tombstones once all replicas acknowledge the deletion. This is exactly how Cassandra, LevelDB, and RocksDB handle deletion. Oxide Tombstone brings this pattern to GPU memory management with version tracking and ternary lifecycle states.
 
-Tombstone deletion solves this: instead of freeing memory, you mark it with a tombstone (-1). The tombstone propagates to all devices. Once every device acknowledges the tombstone, you know it's safe to free. No coordination overhead during normal reads — only during deletion.
+## How It Works
 
-## Architecture
+### Entry Lifecycle
 
 ```
-Device A: Data[key=42] = value
-                ↓ tombstone(42)
-Device A: Data[key=42] = TOMBSTONE (-1)
-                ↓ propagate
-Device B: sees tombstone, sends ACK
-Device C: sees tombstone, sends ACK
-                ↓ all ACKs received
-Garbage Collector: free(key=42)
+put(key, value)         → Entry { state: Alive (+1), version: V }
+tombstone(key)          → Entry { state: Tombstoned (0), version: V+1 }
+purge(tombstone_key)    → Entry { state: Purged (-1) }  // physical removal
 ```
 
-### Key Types
+State transitions: `Alive → Tombstoned → Purged` (one-way). No transition can revive a purged entry.
 
-- **`Tombstone`** — Deletion marker with timestamp, origin device, and acknowledgment bitmap.
-- **`TombstoneMap`** — Tracks which keys are tombstoned. O(1) lookup: is this key alive or dead?
-- **`GarbageCollector`** — Reclaims tombstoned data only after all devices acknowledge. Configurable sweep interval.
-- **`TombstoneStats`** — Active tombstones, pending ACKs, bytes reclaimable, oldest uncollected tombstone.
+### Visibility Semantics
 
-## Usage
+```
+get(key):
+  if entry.state == Alive (+1):
+    return Some(entry.value)
+  else:
+    return None    // Tombstoned and Purged are invisible
+```
+
+Read cost: **O(1)** via HashMap lookup.
+
+### Versioning
+
+Each write operation increments a global version counter:
+
+```
+version: u64 (monotonic)
+
+put(key, value)   → version += 1, entry.version = version
+tombstone(key)    → version += 1, entry.version = version
+```
+
+Versioning enables MVCC (Multi-Version Concurrency Control): readers at version V see only entries with `version ≤ V` and `state = Alive`.
+
+### Compaction
+
+The compaction pass physically removes Purged entries and optionally reclaims space from old Tombstoned entries:
+
+```
+compact():
+  for each entry where state == Purged:
+    remove from HashMap    // O(1) per entry
+  for each entry where state == Tombstoned and age > threshold:
+    mark as Purged → remove
+```
+
+Compaction cost: **O(N)** where N = total entries. Should run periodically during low-load periods.
+
+### Conservation Tracking
+
+```
+alive_count      = count(state == Alive)
+tombstone_count  = count(state == Tombstoned)
+purge_count      = count(state == Purged)
+
+conservation_check: alive + tombstoned + purged = total_entries
+```
+
+The tombstone_count and purge_count are tracked as **O(1)** running counters.
+
+## Quick Start
 
 ```rust
-use oxide_tombstone::*;
+use oxide_tombstone::{TombstoneStore, EntryState};
 
-let mut map = TombstoneMap::new(3); // 3 devices in cluster
+let mut store = TombstoneStore::new();
 
-// Insert data
-map.insert(42, my_data);
+let v1 = store.put(b"key1", b"value1");
+store.put(b"key2", b"value2");
 
-// Delete via tombstone
-map.tombstone(42, DeviceId(0)); // Device 0 initiates deletion
+assert_eq!(store.get(b"key1"), Some(&b"value1"[..]));
 
-// Other devices acknowledge
-map.acknowledge(42, DeviceId(1));
-map.acknowledge(42, DeviceId(2));
+store.tombstone(b"key1");
+assert_eq!(store.get(b"key1"), None); // Tombstoned — invisible
+assert_eq!(store.tombstone_count(), 1);
 
-// Now safe to garbage collect
-let stats = map.gc();
-println!("Reclaimed {} bytes", stats.bytes_reclaimed);
-
-// Check if key is usable
-if map.is_alive(42) {
-    // Key is available for new data
-}
+store.compact(); // Physically removes tombstoned entries past threshold
 ```
 
-## The Deeper Idea
+## API
 
-Tombstones are the distributed systems equivalent of grace periods. The same pattern appears in:
-- CRDTs: mark-then-merge semantics
-- `oxide-epoch`: Grace period before memory reclamation
-- `agent-semiosis`: Sign death before replacement (the old sign isn't removed until all agents have seen the replacement)
-- Git: Deleted branches still exist as unreachable objects until `git gc`
+| Type | Description |
+|------|-------------|
+| `TombstoneStore` | Key-value store with ternary entry lifecycle |
+| `Entry` | key, value, state, version |
+| `EntryState` | `Alive (+1)`, `Tombstoned (0)`, `Purged (-1)` |
 
-The ternary state of a key (Alive/+1, Tombstoned/0, Reclaimed/-1) is the same lifecycle as every other resource in the ecosystem. Deletion is a process, not an event.
+Key methods: `put(k,v)`, `get(k)`, `tombstone(k)`, `purge(k)`, `compact()`, `version()`.
 
-## Related Crates
+## Architecture Notes
 
-- `oxide-epoch` — Epoch-based reclamation (complementary approach to safe freeing)
-- `oxide-journal` — Write-ahead log (tombstones are journaled for crash recovery)
-- `oxide-federation` — Cross-cluster tombstone propagation
-- `smartcrdt` — CRDT-based conflict resolution using tombstone semantics
+Oxide Tombstone provides safe deletion for GPU data structures in the oxide-* stack. In γ + η = C, tombstoning is η (avoidance — marking data as deleted without risking concurrent readers) while compaction is γ (growth — reclaiming physical space for new allocations). Works with `oxide-epoch` for safe reclamation timing and `oxide-chunk` for memory pool management.
+
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU data management architecture.
+
+## References
+
+1. Lakshman, A. & Malik, P. (2010). "Cassandra: A Decentralized Structured Storage System." *ACM SIGOPS*.
+2. Dong, S. et al. (2017). "RocksDB: Evolution of a Key-Value Store." *VLDB*.
+3. Baker, J. et al. (2011). "Megastore: Providing Scalable, Highly Available Storage." *CIDR*.
+
+## License
+
+MIT
